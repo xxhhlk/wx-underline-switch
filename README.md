@@ -6,6 +6,8 @@
 
 带图形界面，单文件 exe，绿色免安装。
 
+**[下载最新版](https://github.com/xxhhlk/wx-underline-switch/releases/latest)** — `WxUnderlineSwitch.exe`，11.2 MB，无需安装运行时。
+
 ---
 
 ## 效果
@@ -57,10 +59,10 @@ Windows 桌面端 `android` / `ios` / `harmony` 恒为 `false`，所以 `se` 和
 
 ## 使用方法
 
-> 仓库不附带预编译 exe，按下方「自己构建」一节打包（`build.ps1` 一条命令），或直接 `python src\wx_underline_switch.py` 运行（需 Python 3.8+ 带 tkinter）。
+> 从 [Releases](https://github.com/xxhhlk/wx-underline-switch/releases/latest) 下载 `WxUnderlineSwitch.exe`，或自行构建（见「自己构建」一节，`build.ps1` 一条命令，会同时生成中文名副本 `微信划线开关.exe`），也可以直接 `python src\wx_underline_switch.py` 运行（需 Python 3.8+ 带 tkinter）。
 
 1. **完全退出微信**（托盘图标右键退出，确认任务管理器里 `Weixin.exe` 和 `WeChatAppEx.exe` 都消失）
-2. 双击 `微信划线开关.exe`
+2. 双击 `WxUnderlineSwitch.exe`
 3. 点「关闭划线」
 4. 启动微信生效
 
@@ -69,9 +71,9 @@ Windows 桌面端 `android` / `ios` / `harmony` 恒为 `false`，所以 `se` 和
 ### 命令行
 
 ```bat
-微信划线开关.exe --cli status
-微信划线开关.exe --cli apply
-微信划线开关.exe --cli revert
+WxUnderlineSwitch.exe --cli status
+WxUnderlineSwitch.exe --cli apply
+WxUnderlineSwitch.exe --cli revert
 ```
 
 可附加 `--target <RadiumWMPF.bin 路径>` 跳过自动定位。
