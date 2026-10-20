@@ -8,6 +8,8 @@
 
 **[下载最新版](https://github.com/xxhhlk/wx-underline-switch/releases/latest)** — `WxUnderlineSwitch.exe`，11.2 MB，无需安装运行时。
 
+> **使用前必读**：`RadiumWMPF.bin` 里的 `flue.dll` 带腾讯 Authenticode 签名，改文件必然破坏它。微信会因此周期性弹出「微信遇到问题，将影响网页正常浏览，可重启微信后恢复」，重启即恢复、补丁仍然有效。这个提示无法消除（签名私钥只有腾讯持有）。详见[组件完整性校验](#组件完整性校验)。
+
 ---
 
 ## 效果
@@ -67,6 +69,8 @@ Windows 桌面端 `android` / `ios` / `harmony` 恒为 `false`，所以 `se` 和
 4. 启动微信生效
 
 工具会自动定位 `RadiumWMPF.bin`，覆盖普通安装目录和 Sandboxie 沙盒布局。识别不到时可用「浏览」手动指定。
+
+用后微信会周期性弹出「微信遇到问题，将影响网页正常浏览，可重启微信后恢复」——这是文件签名被改动后的正常反应，点「暂不处理」或重启即可，补丁不会丢。原因和彻底还原方式见[组件完整性校验](#组件完整性校验)。
 
 ### 命令行
 
@@ -204,26 +208,63 @@ findstr /C:"4.1.15" "C:\Program Files\Tencent\Weixin\Weixin.exe"
   ...
 ```
 
-划线开关那条 JS 就落在 `runtime/flue.dll` 这个条目里。改完之后有两层完整性信息会对不上：
+划线开关那条 JS 就落在 `runtime/flue.dll` 这个条目里。改完之后有三层完整性信息会对不上：
 
 | 层 | 内容 | 能不能修 |
 |---|---|---|
 | ① ZIP 条目 CRC32 | 本地文件头 + 中央目录各记一份 | **能**，重算写回即可，不涉及任何密钥 |
-| ② 清单 md5 + ECDSA 签名 | `file_component.xml` 里 `flue.dll` 的 md5，整份清单有签名 | **不能**，私钥在腾讯手里 |
+| ② 清单 md5 + ECDSA 签名 | `file_component.xml` 里 `flue.dll` 的 md5，整份清单有 ECDSA 签名 | **不能**，私钥在腾讯手里 |
+| ③ **`flue.dll` 自身的 Authenticode 签名** | PE 内嵌证书表，覆盖 `.rdata` 等节 | **不能**，且**这才是实际触发弹窗的那一层** |
 
-工具会自动处理第 ① 层：打完补丁后重算 `runtime/flue.dll` 的 CRC32 并写回两处，让包至少是一个**结构合法的 ZIP**。还原时 CRC 会精确回到原值，因此可以无损回退（离线自检：`scripts/zip_crc_test.py`）。
+### 第 ③ 层是怎么确认的
 
-第 ② 层修不了。所以即便 CRC 已修正，仍有可能遇到微信提示「微信遇到问题，将影响网页正常浏览，可重启微信后恢复」——这是网页进程被回收后的恢复提示，选「暂不处理」后页面会显示 `STATUS_BREAKPOINT`。重启微信即可恢复，补丁仍然生效。
+`ComponentVerification.dll`（腾讯官方签名）的导入表里有 `WinVerifyTrust` —— Windows 的 Authenticode 校验入口，配套的还有一整套 CRYPT32 调用。它验的是 PE 签名，**根本不看 ZIP 的 CRC32**。
 
-要彻底避开这两层，只能不走改文件的路子，改成运行时注入（hook `wmpf_host_export_x64.dll` 或注入 `WeChatAppEx.exe`，在注入脚本执行前改掉那个标志）。目前未实现。
+补丁偏移 `0xC000710` 落在 `flue.dll` 的 `.rdata` 节（Raw `0xBC9D200 ~ 0xDB66600`），正是签名摘要覆盖的范围。改一字节签名必失效。
+
+实测对比：
+
+```
+已打补丁   flue.dll  →  HashMismatch
+原始版本   flue.dll  →  Valid
+同目录其余文件        →  Valid
+```
+
+### 工具能修到哪一层
+
+工具会自动处理第 ① 层：打完补丁后重算 `runtime/flue.dll` 的 CRC32 并写回两处，让包至少是一个**结构合法的 ZIP**。还原时 CRC 精确回到原值，因此可以无损回退（离线自检：`scripts/zip_crc_test.py`）。
+
+②③ 两层无解。所以**打完补丁后微信会周期性弹出**：
+
+> 微信遇到问题，将影响网页正常浏览，可重启微信后恢复。（立即重启 / 暂不处理）
+
+选「暂不处理」时网页会显示 `STATUS_BREAKPOINT`。重启微信即恢复，补丁仍然生效。这个提示无法通过改文件消除，只能接受。
+
+### 还原后还要清理解压副本
+
+微信会把组件从 `RadiumWMPF.bin` 解压到用户目录再加载：
+
+```
+%APPDATA%\Tencent\xwechat\xplugin\plugins\RadiumWMPF\<版本号>\extracted\runtime\flue.dll
+```
+
+`--cli revert` 只还原 `.bin`，**不会动这份已解压的文件**。如果它是在补丁期间解压出来的，内容仍是被改过的、签名仍是坏的，下次启动可能继续用它。
+
+彻底还原的方法（需先完全退出微信）：删除对应的 `extracted` 目录让微信重新解压，或从已还原的 `.bin` 里把 `runtime/flue.dll` 条目原样复制回去。
+
+### 为什么不走运行时注入
+
+理论上可以只改进程内存、让文件保持原样，从而绕开全部三层。这需要常驻一个后台进程，逐个接管新开的 `WeChatAppEx.exe`，并先 `VirtualProtectEx` 再写内存。改动面和维护成本都比本工具大得多，因此未实现。
 
 ---
 
 ## 风险与回滚
 
 - 改动只涉及 `RadiumWMPF.bin` 里 `runtime/flue.dll` 条目的 8 个字节 + 该条目的 CRC32 字段，不影响 `Weixin.exe` / `Weixin.dll`。
+- 会周期性触发「微信遇到问题，将影响网页正常浏览」提示，原因是 `flue.dll` 的 Authenticode 签名被破坏。重启微信即恢复，补丁不丢。这一层改不掉。
 - 若微信无法启动或内置浏览器异常，退出微信后点「还原」，或执行 `--cli revert`。
 - 还原会写回原始 8 字节、重算回原始 CRC32，并校验 SHA1 是否与改动前一致。
+- **还原不会清理 `%APPDATA%\Tencent\xwechat\xplugin\...\extracted\runtime\flue.dll`**，那份解压副本可能仍是被改过的。彻底还原见上一节。
 - 微信升级前建议先还原，避免升级流程对文件做完整性校验时出现意外（见上一节）。
 
 ---
@@ -231,8 +272,11 @@ findstr /C:"4.1.15" "C:\Program Files\Tencent\Weixin\Weixin.exe"
 ## 已知限制
 
 - 仅支持 Windows 桌面版微信。
+- **改文件必然触发 Authenticode 校验失败**，表现为周期性弹窗。无法通过改文件规避，只能重启微信。详见[组件完整性校验](#组件完整性校验)。
+- `--cli revert` 只还原 `.bin`，不清理 `xplugin` 下的解压副本。
 - 未实现 per-monitor 动态 DPI 切换（Tk 8.6 支持有限）。修改系统缩放比例后需重启程序。
 - 关闭后划线评论面板一并失效，这是该功能的整体能力，不是单独去掉视觉。
+- 只对 Windows 有效。iOS / Android 的 `ios(>=8.0.32)`、`android(...)` 是独立通路，把 `support_mp_underline` 改成假值关不掉那边的划线。
 
 ---
 

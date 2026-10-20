@@ -240,10 +240,13 @@ def weixin_running():
 
 # RadiumWMPF.bin 本身是一个 ZIP 包（46 个条目，全部 stored 不压缩），
 # 第一个条目是 file_component.xml，带逐文件 md5 与 ECDSA 签名。
-# 划线开关那条 JS 落在 runtime/flue.dll 条目里，所以改写之后：
+# 划线开关那条 JS 落在 runtime/flue.dll 条目里，所以改写之后有三层对不上：
 #   ① 该条目的 CRC32 与本地文件头 / 中央目录里记的值对不上 —— 这一层可以重算修好；
-#   ② file_component.xml 里 flue.dll 的 md5 也变了，而清单有签名 —— 这一层修不了。
-# 这里只处理第 ① 层，让包至少是一个结构合法的 ZIP。
+#   ② file_component.xml 里 flue.dll 的 md5 也变了，而清单有签名 —— 这一层修不了；
+#   ③ flue.dll 自身的 Authenticode 签名覆盖 .rdata，改一字节即失效 —— 这一层也修不了，
+#      而且它才是微信周期性弹「网页组件损坏」的真因（ComponentVerification.dll 调
+#      WinVerifyTrust 验的是 PE 签名，压根不看 ZIP 的 CRC）。
+# 这里只处理第 ① 层，让包至少是一个结构合法的 ZIP；②③ 无解，弹窗无法通过改文件消除。
 
 ZIP_EOCD = b"PK\x05\x06"
 ZIP_CD = b"PK\x01\x02"
