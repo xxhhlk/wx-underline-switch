@@ -68,15 +68,35 @@ Windows 桌面端 `android` / `ios` / `harmony` 恒为 `false`，所以 `se` 和
 
 工具会自动定位 `RadiumWMPF.bin`，覆盖普通安装目录和 Sandboxie 沙盒布局。识别不到时可用「浏览」手动指定。
 
+### 两种模式
+
+改文件会破坏 `flue.dll` 的 Authenticode 签名，微信会弹「微信遇到问题，将影响网页正常浏览」。想彻底避开这个提示，用**内存注入**：改的是进程内存，文件一个字节都不动，签名/CRC/清单全部保持原样。
+
+| | 改文件 | 内存注入 |
+|---|---|---|
+| 微信状态 | 必须**完全退出** | 必须**运行中** |
+| 改动对象 | `RadiumWMPF.bin` 里的 8 字节 | 进程内存里的 4 字符 |
+| 文件签名 | 被破坏 | **完好** |
+| 弹窗 | 会出现 | 不出现 |
+| 生效范围 | 持久，直到微信升级 | 当前进程；需常驻才能覆盖新进程 |
+
+内存注入有两种用法：点「内存注入」关一次（只影响当前已打开的网页进程），或点「开启常驻注入」后台轮询，自动处理之后新开的每一个进程。常驻方式需要工具一直运行。
+
+> 内存注入只在微信已启动、且加载过网页（存在 `WeChatAppEx.exe` 进程）之后才有目标可改。建议先打开任意一篇公众号文章再点按钮。
+
 ### 命令行
 
 ```bat
-WxUnderlineSwitch.exe --cli status
-WxUnderlineSwitch.exe --cli apply
-WxUnderlineSwitch.exe --cli revert
+WxUnderlineSwitch.exe --cli status          :: 查看文件补丁状态
+WxUnderlineSwitch.exe --cli apply           :: 改文件关闭（需微信退出）
+WxUnderlineSwitch.exe --cli revert          :: 改文件还原
+WxUnderlineSwitch.exe --cli inject          :: 内存注入一次（需微信运行）
+WxUnderlineSwitch.exe --cli watch           :: 常驻注入，Ctrl+C 停止
 ```
 
-可附加 `--target <RadiumWMPF.bin 路径>` 跳过自动定位。
+`--cli inject` / `watch` 可附加 `--dry-run`，只定位并打印，不写入。
+
+`status` / `apply` / `revert` 可附加 `--target <RadiumWMPF.bin 路径>` 跳过自动定位。
 
 ---
 
@@ -204,18 +224,29 @@ findstr /C:"4.1.15" "C:\Program Files\Tencent\Weixin\Weixin.exe"
   ...
 ```
 
-划线开关那条 JS 就落在 `runtime/flue.dll` 这个条目里。改完之后有两层完整性信息会对不上：
+划线开关那条 JS 就落在 `runtime/flue.dll` 这个条目里。改完之后有三层完整性信息会对不上：
 
 | 层 | 内容 | 能不能修 |
 |---|---|---|
 | ① ZIP 条目 CRC32 | 本地文件头 + 中央目录各记一份 | **能**，重算写回即可，不涉及任何密钥 |
-| ② 清单 md5 + ECDSA 签名 | `file_component.xml` 里 `flue.dll` 的 md5，整份清单有签名 | **不能**，私钥在腾讯手里 |
+| ② 清单 md5 + ECDSA 签名 | `file_component.xml` 里 `flue.dll` 的 md5，整份清单有签名 | 不能，私钥在腾讯手里 |
+| ③ **flue.dll 的 Authenticode 签名** | PE 内嵌证书表，覆盖 `.rdata` 等节 | **不能**，且**这才是实际触发弹窗的那一层** |
 
-工具会自动处理第 ① 层：打完补丁后重算 `runtime/flue.dll` 的 CRC32 并写回两处，让包至少是一个**结构合法的 ZIP**。还原时 CRC 会精确回到原值，因此可以无损回退（离线自检：`scripts/zip_crc_test.py`）。
+第 ③ 层是实测确认的：`ComponentVerification.dll`（腾讯官方签名）的导入表里有 **`WinVerifyTrust`**（Windows 的 Authenticode 校验入口）和 `CryptQueryObject` 一整套 CRYPT32 调用 —— 它验的是 PE 签名，**根本不看 ZIP 的 CRC32**。而补丁偏移 `0xC000710` 正落在 `flue.dll` 的 `.rdata` 节（Raw `0xBC9D200 ~ 0xDB66600`），属于签名摘要的覆盖范围。
 
-第 ② 层修不了。所以即便 CRC 已修正，仍有可能遇到微信提示「微信遇到问题，将影响网页正常浏览，可重启微信后恢复」——这是网页进程被回收后的恢复提示，选「暂不处理」后页面会显示 `STATUS_BREAKPOINT`。重启微信即可恢复，补丁仍然生效。
+签名状态实测：
 
-要彻底避开这两层，只能不走改文件的路子，改成运行时注入（hook `wmpf_host_export_x64.dll` 或注入 `WeChatAppEx.exe`，在注入脚本执行前改掉那个标志）。目前未实现。
+```
+25799（已改）  flue.dll  →  HashMismatch
+19841（原始）  flue.dll  →  Valid
+其余全部文件   →  Valid
+```
+
+所以工具会自动处理第 ① 层（重算 `runtime/flue.dll` 的 CRC32 并写回两处，让包至少是结构合法的 ZIP，还原时 CRC 精确回原值），但**②③ 两层无解**。
+
+**要彻底不弹窗，只有内存注入这条路** —— 让 `flue.dll` 从磁盘到内存都不被改动。工具已实现，见上一节。
+
+弹窗文案来自 `Weixin.dll`（主程序），UTF-8 明文：`微信遇到问题` / `影响网页正常浏览` / `重启微信后恢复` / `立即重启` / `暂不处理`。它是网页进程被回收后的恢复提示，选「暂不处理」页面会显示 `STATUS_BREAKPOINT`，重启微信即恢复，补丁仍然生效。
 
 ---
 
