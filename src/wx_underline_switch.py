@@ -37,6 +37,7 @@ import subprocess
 import sys
 import threading
 import zlib
+from ctypes import wintypes
 
 APP_NAME = "WxUnderlineSwitch"
 BIN_NAME = "RadiumWMPF.bin"
@@ -426,6 +427,303 @@ def revert_patch(path, log=print, progress=None):
     return True, "已还原，共恢复 %d 处" % len(todo)
 
 
+# ---------------------------------------------------------------- 运行时注入
+
+# 为什么需要这一节：
+#   RadiumWMPF.bin 里的 flue.dll 带 Authenticode 签名，组件完整性校验
+#   （ComponentVerification.dll，导入 WinVerifyTrust）会验它。改文件必坏签名，
+#   而签名无法重签（私钥在腾讯），于是微信会弹「微信遇到问题，将影响网页正常浏览」。
+#   改内存不动文件，签名/CRC/清单全部保持原样，弹窗就没有触发条件。
+#
+# 做法：轮询新出现的 WeChatAppEx.exe，找到已加载的 flue.dll 映像，
+#       在映像内按特征串定位 `support_mp_underline = <x>;`，把字面量改成 null。
+
+TARGET_EXE = "WeChatAppEx.exe"
+TARGET_DLL = "flue.dll"
+
+PROCESS_QUERY_INFORMATION = 0x0400
+PROCESS_VM_READ = 0x0010
+PROCESS_VM_WRITE = 0x0020
+PROCESS_VM_OPERATION = 0x0008
+TH32CS_SNAPPROCESS = 0x00000002
+TH32CS_SNAPMODULE = 0x00000008
+TH32CS_SNAPMODULE32 = 0x00000010
+PAGE_READWRITE = 0x04
+INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
+
+
+class _PROCESSENTRY32(ctypes.Structure):
+    _fields_ = [("dwSize", wintypes.DWORD), ("cntUsage", wintypes.DWORD),
+                ("th32ProcessID", wintypes.DWORD),
+                ("th32DefaultHeapID", ctypes.POINTER(ctypes.c_ulong)),
+                ("th32ModuleID", wintypes.DWORD), ("cntThreads", wintypes.DWORD),
+                ("th32ParentProcessID", wintypes.DWORD),
+                ("pcPriClassBase", ctypes.c_long), ("dwFlags", wintypes.DWORD),
+                ("szExeFile", ctypes.c_char * 260)]
+
+
+class _MODULEENTRY32(ctypes.Structure):
+    _fields_ = [("dwSize", wintypes.DWORD), ("th32ModuleID", wintypes.DWORD),
+                ("th32ProcessID", wintypes.DWORD), ("GlblcntUsage", wintypes.DWORD),
+                ("ProccntUsage", wintypes.DWORD), ("modBaseAddr", ctypes.c_void_p),
+                ("modBaseSize", wintypes.DWORD), ("hModule", wintypes.HMODULE),
+                ("szModule", ctypes.c_char * 256), ("szExePath", ctypes.c_char * 260)]
+
+
+class _MBI(ctypes.Structure):
+    _fields_ = [("BaseAddress", ctypes.c_void_p), ("AllocationBase", ctypes.c_void_p),
+                ("AllocationProtect", wintypes.DWORD), ("PartitionId", wintypes.WORD),
+                ("RegionSize", ctypes.c_size_t), ("State", wintypes.DWORD),
+                ("Protect", wintypes.DWORD), ("Type", wintypes.DWORD)]
+
+
+_K32 = None
+_INJECTED = set()          # 已经成功改写的 pid；pid 会被复用，退出后必须移除
+
+
+def _k32():
+    """按需初始化 kernel32 的函数签名（64 位下必须显式声明，否则句柄会被截断）。"""
+    global _K32
+    if _K32 is not None:
+        return _K32
+    if sys.platform != "win32":
+        return None
+    k = ctypes.WinDLL("kernel32", use_last_error=True)
+    k.OpenProcess.restype = wintypes.HANDLE
+    k.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    k.CloseHandle.argtypes = [wintypes.HANDLE]
+    k.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
+    k.CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
+    k.Module32First.argtypes = [wintypes.HANDLE, ctypes.POINTER(_MODULEENTRY32)]
+    k.Module32Next.argtypes = [wintypes.HANDLE, ctypes.POINTER(_MODULEENTRY32)]
+    k.Process32First.argtypes = [wintypes.HANDLE, ctypes.POINTER(_PROCESSENTRY32)]
+    k.Process32Next.argtypes = [wintypes.HANDLE, ctypes.POINTER(_PROCESSENTRY32)]
+    k.ReadProcessMemory.argtypes = [wintypes.HANDLE, ctypes.c_void_p, ctypes.c_void_p,
+                                    ctypes.c_size_t, ctypes.POINTER(ctypes.c_size_t)]
+    k.ReadProcessMemory.restype = wintypes.BOOL
+    k.WriteProcessMemory.argtypes = [wintypes.HANDLE, ctypes.c_void_p, ctypes.c_void_p,
+                                     ctypes.c_size_t, ctypes.POINTER(ctypes.c_size_t)]
+    k.WriteProcessMemory.restype = wintypes.BOOL
+    k.VirtualProtectEx.argtypes = [wintypes.HANDLE, ctypes.c_void_p, ctypes.c_size_t,
+                                   wintypes.DWORD, ctypes.POINTER(wintypes.DWORD)]
+    k.VirtualProtectEx.restype = wintypes.BOOL
+    k.VirtualQueryEx.argtypes = [wintypes.HANDLE, ctypes.c_void_p, ctypes.c_void_p,
+                                 ctypes.c_size_t]
+    k.VirtualQueryEx.restype = ctypes.c_size_t
+    _K32 = k
+    return k
+
+
+def target_pids(exe=TARGET_EXE):
+    k = _k32()
+    if not k:
+        return []
+    snap = k.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
+    if snap == INVALID_HANDLE_VALUE or not snap:
+        return []
+    out = []
+    pe = _PROCESSENTRY32()
+    pe.dwSize = ctypes.sizeof(_PROCESSENTRY32)
+    ok = k.Process32First(snap, ctypes.byref(pe))
+    while ok:
+        if pe.szExeFile.decode("mbcs", "replace").lower() == exe.lower():
+            out.append(pe.th32ProcessID)
+        ok = k.Process32Next(snap, ctypes.byref(pe))
+    k.CloseHandle(snap)
+    return out
+
+
+def _modules(pid):
+    k = _k32()
+    snap = k.CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, pid)
+    if snap == INVALID_HANDLE_VALUE or not snap:
+        return []
+    me = _MODULEENTRY32()
+    me.dwSize = ctypes.sizeof(_MODULEENTRY32)
+    out = []
+    ok = k.Module32First(snap, ctypes.byref(me))
+    while ok:
+        out.append((me.modBaseAddr, me.modBaseSize,
+                    me.szExePath.decode("mbcs", "replace")))
+        ok = k.Module32Next(snap, ctypes.byref(me))
+    k.CloseHandle(snap)
+    return out
+
+
+def _read(h, addr, size):
+    k = _k32()
+    buf = ctypes.create_string_buffer(size)
+    got = ctypes.c_size_t(0)
+    if not k.ReadProcessMemory(h, ctypes.c_void_p(addr), buf, size, ctypes.byref(got)):
+        return None
+    return buf.raw[:got.value]
+
+
+def _write(h, addr, data):
+    """写入前临时把页面改成可写，写完还原原属性。返回 (是否成功, 说明)。"""
+    k = _k32()
+    mbi = _MBI()
+    if not k.VirtualQueryEx(h, ctypes.c_void_p(addr), ctypes.byref(mbi), ctypes.sizeof(_MBI)):
+        return False, "VirtualQueryEx 失败"
+    old_protect = mbi.Protect
+
+    changed = wintypes.DWORD(0)
+    need_restore = old_protect != PAGE_READWRITE
+    if need_restore:
+        if not k.VirtualProtectEx(h, ctypes.c_void_p(addr), len(data),
+                                  PAGE_READWRITE, ctypes.byref(changed)):
+            return False, "VirtualProtectEx 失败 err=%d" % ctypes.get_last_error()
+
+    written = ctypes.c_size_t(0)
+    buf = ctypes.create_string_buffer(data, len(data))
+    ok = k.WriteProcessMemory(h, ctypes.c_void_p(addr), buf, len(data),
+                              ctypes.byref(written))
+
+    if need_restore:
+        back = wintypes.DWORD(0)
+        k.VirtualProtectEx(h, ctypes.c_void_p(addr), len(data),
+                           old_protect, ctypes.byref(back))
+    if not ok:
+        return False, "WriteProcessMemory 失败 err=%d" % ctypes.get_last_error()
+    return True, "写入 %d 字节" % written.value
+
+
+def _module_sections(h, base):
+    """读 PE 节表，返回 [(名字, 虚拟偏移, 虚拟大小)]。"""
+    head = _read(h, base, 0x1000)
+    if not head or len(head) < 0x40:
+        return []
+    e_lfanew = struct.unpack_from("<I", head, 0x3C)[0]
+    if e_lfanew + 24 > len(head) or head[e_lfanew:e_lfanew + 4] != b"PE\x00\x00":
+        return []
+    nsec = struct.unpack_from("<H", head, e_lfanew + 6)[0]
+    opt_size = struct.unpack_from("<H", head, e_lfanew + 20)[0]
+    sec_off = e_lfanew + 24 + opt_size
+    need = sec_off + nsec * 40
+    if need > len(head):
+        more = _read(h, base + len(head), need - len(head))
+        if not more:
+            return []
+        head += more
+    if nsec <= 0 or nsec > 96:
+        return []
+    secs = []
+    for i in range(nsec):
+        o = sec_off + i * 40
+        name = head[o:o + 8].rstrip(b"\x00").decode("ascii", "replace")
+        vsize, vaddr = struct.unpack_from("<II", head, o + 8)
+        secs.append((name, vaddr, vsize))
+    return secs
+
+
+def find_literal_in_process(h, base):
+    """在已加载的 flue.dll 映像里定位划线开关字面量。
+
+    返回 (绝对地址, 节名, 字面量)；找不到返回 (None, 说明, None)。
+    """
+    secs = _module_sections(h, base)
+    if not secs:
+        return None, "无法解析节表", None
+
+    needle = NEEDLE.encode("utf-16-le")
+    lit_off = len("support_mp_underline = ") * 2
+    chunk = 4 * 1024 * 1024
+
+    for name, vaddr, vsize in secs:
+        if vsize <= 0:
+            continue
+        pos = 0
+        tail = b""
+        while pos < vsize:
+            n = min(chunk, vsize - pos)
+            d = _read(h, base + vaddr + pos, n)
+            if not d:
+                break
+            buf = tail + d
+            i = buf.find(needle)
+            if i != -1:
+                rel = pos - len(tail) + i
+                addr = base + vaddr + rel
+                raw = _read(h, addr + lit_off, 8) or b""
+                lit = raw.decode("utf-16-le", errors="replace").rstrip("\x00")
+                return addr + lit_off, name, lit
+            tail = buf[-len(needle):]
+            pos += n
+    return None, "映像中未找到特征串", None
+
+
+def poke_process(pid, log=print, dry_run=False):
+    """对单个进程做一次内存改写。返回 True 表示该进程已是关闭状态。"""
+    k = _k32()
+    mods = _modules(pid)
+    hit = None
+    for base, size, path in mods:
+        if path.lower().endswith(TARGET_DLL):
+            hit = (base, size, path)
+            break
+    if not hit:
+        return False
+    base, size, path = hit
+
+    h = k.OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ
+                      | PROCESS_VM_WRITE | PROCESS_VM_OPERATION, False, pid)
+    if not h:
+        return False
+    try:
+        addr, sec, lit = find_literal_in_process(h, base)
+        if not addr:
+            return False
+        if lit == PATCHED_LITERAL:
+            _INJECTED.add(pid)
+            return True
+        if lit != ORIGINAL_LITERAL:
+            log("pid=%d 字面量既不是 %r 也不是 %r，跳过（%r）"
+                % (pid, ORIGINAL_LITERAL, PATCHED_LITERAL, lit))
+            return False
+        if dry_run:
+            log("pid=%d 找到 %s@0x%X 字面量=%r（dry-run，未写入）"
+                % (pid, sec, addr - base, lit))
+            return False
+        ok, why = _write(h, addr, PATCHED_LITERAL.encode("utf-16-le"))
+        if ok:
+            _INJECTED.add(pid)
+            log("pid=%d %s.%s@0x%X  %r -> %r" % (pid, sec, TARGET_DLL,
+                                                 addr - base, lit, PATCHED_LITERAL))
+        else:
+            log("pid=%d 写入失败: %s" % (pid, why))
+        return ok
+    finally:
+        k.CloseHandle(h)
+
+
+def watch_loop(stop_event, log=print, interval=0.2, dry_run=False):
+    """轮询新出现的网页进程并改写内存，直到 stop_event 被设置。"""
+    if not _k32():
+        log("运行时注入仅支持 Windows")
+        return
+    log("运行时注入已启动：每 %.1fs 检查一次新的 %s 进程" % (interval, TARGET_EXE))
+    if dry_run:
+        log("（dry-run 模式：只定位不写入）")
+    while not stop_event.is_set():
+        try:
+            alive = set()
+            for pid in target_pids():
+                alive.add(pid)
+                if pid in _INJECTED:
+                    continue
+                try:
+                    poke_process(pid, log, dry_run)
+                except Exception as exc:                  # noqa: BLE001
+                    log("pid=%d 处理异常: %s" % (pid, exc))
+            # 进程退出后从已处理集合里移除；pid 会被复用，必须清理
+            # 用方法调用而非 &= 赋值，避免被当成局部变量重绑定
+            _INJECTED.intersection_update(alive)
+        except Exception as exc:                          # noqa: BLE001
+            log("轮询异常: %s" % exc)
+        stop_event.wait(interval)
+    log("运行时注入已停止")
+
+
 # ---------------------------------------------------------------- 高 DPI
 
 def enable_dpi_awareness():
@@ -537,7 +835,7 @@ def run_gui():
 
     btn_row = ttk.Frame(outer)
     btn_row.pack(fill="x", pady=px(10))
-    btn_apply = ttk.Button(btn_row, text="关闭划线")
+    btn_apply = ttk.Button(btn_row, text="关闭划线（改文件）")
     btn_apply.pack(side="left")
     btn_revert = ttk.Button(btn_row, text="还原")
     btn_revert.pack(side="left", padx=px(8))
@@ -545,6 +843,16 @@ def run_gui():
     btn_refresh.pack(side="left")
     ttk.Button(btn_row, text="打开配置文件目录",
                command=lambda: os.startfile(config_dir())).pack(side="right")
+
+    inject_row = ttk.Frame(outer)
+    inject_row.pack(fill="x", pady=(0, px(10)))
+    btn_inject = ttk.Button(inject_row, text="内存注入（关一次，不改文件）")
+    btn_inject.pack(side="left")
+    btn_watch = ttk.Button(inject_row, text="开启常驻注入")
+    btn_watch.pack(side="left", padx=px(8))
+    inject_var = tk.StringVar(value="常驻注入：未运行")
+    ttk.Label(inject_row, textvariable=inject_var,
+              foreground="#555").pack(side="left", padx=px(6))
 
     log_box = ttk.LabelFrame(outer, text=" 日志 ", padding=px(6))
     log_box.pack(fill="both", expand=True)
@@ -687,7 +995,71 @@ def run_gui():
     btn_revert.configure(command=do_revert)
     btn_refresh.configure(command=refresh)
 
-    log("提示：修改前请完全退出微信，修改后重新启动微信生效。")
+    # ---- 运行时注入 ----
+
+    inject_state = {"stop": None, "thread": None}
+
+    def do_inject():
+        set_busy(True, "注入中…")
+
+        def work():
+            pids = target_pids()
+            if not pids:
+                post(lambda: (set_busy(False),
+                              _write_log("没有正在运行的 %s 进程" % TARGET_EXE),
+                              messagebox.showwarning(
+                                  "未找到进程",
+                                  "微信没有在运行，或还没有打开过公众号文章。\n\n"
+                                  "内存注入要求微信正在运行。")))
+                return
+            log("找到 %d 个 %s 进程" % (len(pids), TARGET_EXE))
+            done = 0
+            for pid in pids:
+                if poke_process(pid, log):
+                    done += 1
+
+            def fin():
+                set_busy(False)
+                bar.configure(value=0)
+                msg = "已在 %d / %d 个进程中关闭划线" % (done, len(pids))
+                _write_log(msg)
+                if done:
+                    messagebox.showinfo("完成", msg)
+                else:
+                    messagebox.showwarning(
+                        "未注入成功", msg + "\n\n可能原因：flue.dll 尚未加载，稍后再试。")
+
+            post(fin)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def toggle_watch():
+        if inject_state["thread"] is not None:
+            inject_state["stop"].set()
+            inject_state["thread"] = None
+            inject_state["stop"] = None
+            btn_watch.configure(text="开启常驻注入")
+            inject_var.set("常驻注入：未运行")
+            return
+        stop = threading.Event()
+        inject_state["stop"] = stop
+        inject_state["thread"] = threading.Thread(
+            target=watch_loop, args=(stop, log), daemon=True)
+        inject_state["thread"].start()
+        btn_watch.configure(text="停止常驻注入")
+        inject_var.set("常驻注入：运行中")
+
+    btn_inject.configure(command=do_inject)
+    btn_watch.configure(command=toggle_watch)
+
+    def on_close():
+        if inject_state["stop"] is not None:
+            inject_state["stop"].set()
+        root.destroy()
+
+    root.protocol("WM_DELETE_WINDOW", on_close)
+
+    log("提示：改文件模式需先完全退出微信；内存注入模式需微信正在运行。")
     drain()
     refresh()
     root.mainloop()
@@ -710,10 +1082,35 @@ def _ensure_console():
         pass
 
 
-def run_cli(action, target):
+def run_cli(action, target, dry_run=False):
     _ensure_console()
     if sys.stdout is None:
         return 2
+
+    # 内存注入不涉及文件，不需要 target
+    if action == "inject":
+        pids = target_pids()
+        if not pids:
+            print("没有正在运行的 %s 进程（微信未启动或没有打开过网页）" % TARGET_EXE)
+            return 1
+        print("找到 %d 个 %s 进程" % (len(pids), TARGET_EXE))
+        done = 0
+        for pid in pids:
+            if poke_process(pid, print, dry_run):
+                done += 1
+        print("已在 %d/%d 个进程中关闭划线" % (done, len(pids)))
+        return 0 if done else 1
+
+    if action == "watch":
+        stop = threading.Event()
+        try:
+            watch_loop(stop, print, dry_run=dry_run)
+        except KeyboardInterrupt:
+            print("\n收到中断，退出")
+        finally:
+            stop.set()
+        return 0
+
     path = target or auto_target()
     if not path:
         print("未找到 RadiumWMPF.bin，请用 --target 指定")
@@ -739,12 +1136,15 @@ def run_cli(action, target):
 
 def main():
     parser = argparse.ArgumentParser(description="微信划线开关")
-    parser.add_argument("--cli", choices=["status", "apply", "revert"],
-                        help="命令行模式")
+    parser.add_argument("--cli",
+                        choices=["status", "apply", "revert", "inject", "watch"],
+                        help="命令行模式；inject/watch 走运行时内存注入，不改文件")
     parser.add_argument("--target", help="RadiumWMPF.bin 路径")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="只定位不写入（配合 --cli inject / watch）")
     args = parser.parse_args()
     if args.cli:
-        return run_cli(args.cli, args.target)
+        return run_cli(args.cli, args.target, args.dry_run)
     run_gui()
     return 0
 
