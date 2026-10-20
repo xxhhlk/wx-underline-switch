@@ -335,6 +335,17 @@ def apply_patch(path, log=print, progress=None):
         return False, "未在文件中找到划线开关特征串，可能是新版本改了写法"
     todo = [s for s in sites if s[3] == "original"]
     if not todo:
+        # 已经关闭，但 CRC 可能还是旧版本工具留下的失配值，补一遍
+        fixed = 0
+        for off, enc, width, state, literal in sites:
+            if state != "patched":
+                continue
+            info = zip_refresh_crc(path, off, log)
+            if info and info[3]:
+                log("ZIP 条目 %s CRC32: 0x%08X -> 0x%08X（已写回）" % (info[0], info[1], info[2]))
+                fixed += 1
+        if fixed:
+            return True, "已经是关闭状态，另修正了 %d 处 ZIP CRC" % fixed
         return True, "已经是关闭状态，无需操作"
 
     cfg = load_config()
