@@ -32,9 +32,11 @@ import json
 import os
 import queue
 import re
+import struct
 import subprocess
 import sys
 import threading
+import zlib
 
 APP_NAME = "WxUnderlineSwitch"
 BIN_NAME = "RadiumWMPF.bin"
@@ -234,6 +236,89 @@ def weixin_running():
     return "Weixin.exe" in (proc.stdout or "")
 
 
+# ---------------------------------------------------------------- ZIP 完整性
+
+# RadiumWMPF.bin 本身是一个 ZIP 包（46 个条目，全部 stored 不压缩），
+# 第一个条目是 file_component.xml，带逐文件 md5 与 ECDSA 签名。
+# 划线开关那条 JS 落在 runtime/flue.dll 条目里，所以改写之后：
+#   ① 该条目的 CRC32 与本地文件头 / 中央目录里记的值对不上 —— 这一层可以重算修好；
+#   ② file_component.xml 里 flue.dll 的 md5 也变了，而清单有签名 —— 这一层修不了。
+# 这里只处理第 ① 层，让包至少是一个结构合法的 ZIP。
+
+ZIP_EOCD = b"PK\x05\x06"
+ZIP_CD = b"PK\x01\x02"
+ZIP_LH = b"PK\x03\x04"
+
+
+def zip_locate_entry(path, inner_offset):
+    """找出数据区包含 inner_offset 的 ZIP 条目，返回其 CRC 字段位置。"""
+    try:
+        size = os.path.getsize(path)
+        with open(path, "rb") as fh:
+            fh.seek(max(0, size - 65536))
+            tail = fh.read()
+            pos = tail.rfind(ZIP_EOCD)
+            if pos < 0:
+                return None
+            (_s, _d1, _d2, _n1, n_total, cd_size, cd_off, _cl) = struct.unpack_from("<IHHHHIIH", tail, pos)
+            if not (0 < n_total < 10000) or cd_off + cd_size > size:
+                return None
+            fh.seek(cd_off)
+            cd = fh.read(cd_size)
+            p = 0
+            for _ in range(n_total):
+                if cd[p:p + 4] != ZIP_CD:
+                    return None
+                (_sig, _vm, _vn, _fl, method, _mt, _md, crc, csize, _us,
+                 nlen, elen, clen, _ds, _ia, _ea, loff) = struct.unpack_from("<IHHHHHHIIIHHHHHII", cd, p)
+                fh.seek(loff)
+                lh = fh.read(30)
+                if lh[:4] != ZIP_LH:
+                    return None
+                (l_nlen, l_elen) = struct.unpack_from("<HH", lh, 26)
+                data_off = loff + 30 + l_nlen + l_elen
+                if data_off <= inner_offset < data_off + csize:
+                    return {"name": cd[p + 46:p + 46 + nlen].decode("utf-8", "replace"),
+                            "method": method, "data_off": data_off, "csize": csize,
+                            "crc": crc, "crc_local_off": loff + 14, "crc_cd_off": cd_off + p + 16}
+                p += 46 + nlen + elen + clen
+    except (OSError, struct.error):
+        return None
+    return None
+
+
+def zip_refresh_crc(path, inner_offset, log=print):
+    """重算被改条目的 CRC32，写回本地文件头与中央目录。返回 (名字, 旧值, 新值, 是否改动)。"""
+    ent = zip_locate_entry(path, inner_offset)
+    if not ent:
+        log("不是 ZIP 包或未定位到条目，跳过 CRC 修复")
+        return None
+    if ent["method"] != 0:
+        log("条目 %s 是压缩存储，跳过 CRC 修复" % ent["name"])
+        return None
+
+    crc = 0
+    with open(path, "rb") as fh:
+        fh.seek(ent["data_off"])
+        remain = ent["csize"]
+        while remain > 0:
+            buf = fh.read(min(CHUNK, remain))
+            if not buf:
+                break
+            crc = zlib.crc32(buf, crc)
+            remain -= len(buf)
+    crc &= 0xFFFFFFFF
+    changed = crc != ent["crc"]
+    if changed:
+        with open(path, "r+b") as fh:
+            for off in (ent["crc_local_off"], ent["crc_cd_off"]):
+                fh.seek(off)
+                fh.write(struct.pack("<I", crc))
+            fh.flush()
+            os.fsync(fh.fileno())
+    return ent["name"], ent["crc"], crc, changed
+
+
 # ---------------------------------------------------------------- 动作
 
 def apply_patch(path, log=print, progress=None):
@@ -270,6 +355,15 @@ def apply_patch(path, log=print, progress=None):
             log("已改写 0x%X (%s) %r -> %r" % (off, enc, literal, PATCHED_LITERAL))
         fh.flush()
         os.fsync(fh.fileno())
+
+    # 改写落在 ZIP 条目内部，条目 CRC32 已失配，重算写回（本地头 + 中央目录）
+    for site in entry["sites"]:
+        info = zip_refresh_crc(path, site["offset"], log)
+        if info:
+            name, old, new, changed = info
+            log("ZIP 条目 %s CRC32: 0x%08X -> 0x%08X%s"
+                % (name, old, new, "（已写回）" if changed else "（一致，无需改）"))
+
     entry["sha1_after"] = sha1_of_file(path)
     backups[path] = entry
     cfg["target"] = path
@@ -302,6 +396,14 @@ def revert_patch(path, log=print, progress=None):
             log("已还原 0x%X (%s) %r -> %r" % (off, enc, literal, ORIGINAL_LITERAL))
         fh.flush()
         os.fsync(fh.fileno())
+
+    # 还原后数据回到原始状态，CRC32 重算应当正好回到原值
+    for off, enc, width, state, literal in todo:
+        info = zip_refresh_crc(path, off, log)
+        if info:
+            name, old, new, changed = info
+            log("ZIP 条目 %s CRC32: 0x%08X -> 0x%08X%s"
+                % (name, old, new, "（已写回）" if changed else "（一致，无需改）"))
 
     cfg = load_config()
     entry = cfg.get("backups", {}).get(path)

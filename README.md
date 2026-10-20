@@ -169,6 +169,7 @@ wx-underline-switch/
 └── scripts/
     ├── make_icon.py             纯标准库生成 ICO
     ├── gui_smoketest.py         GUI 冒烟测试（打桩 tkinter，不开窗口）
+    ├── zip_crc_test.py          ZIP CRC 修复逻辑的离线自检
     └── recon/                   定位 patch 点的侦察脚本，见该目录 README
 ```
 
@@ -178,16 +179,52 @@ wx-underline-switch/
 
 微信大版本更新会重装 `RadiumWMPF.bin`，patch 被覆盖回 `true`。重新运行工具点一次「关闭划线」即可——这正是做成工具而不是一次性脚本的原因。
 
+注意微信 4.x 是**静默自动升级**：不弹确认框，升级时把整个版本目录（如 `4.1.15.55`）换成新的（`4.1.15.56`），旧目录直接删掉。所以你可能完全没察觉，直到发现划线又回来了。
+
+想确认当前版本，可以直接在启动器里搜版本串（微信的 PE 没有版本资源，`GetFileVersionInfo` 查不出来）：
+
+```bat
+findstr /C:"4.1.15" "C:\Program Files\Tencent\Weixin\Weixin.exe"
+```
+
+或者看 `C:\Program Files\Tencent\Weixin\` 下有几个版本目录、哪个是新建的。
+
 如果新版本改了注入写法导致状态显示 `unknown`，可以用 `scripts/recon/` 里的脚本重新定位特征串。
+
+---
+
+## 组件完整性校验
+
+`RadiumWMPF.bin` 不是普通文件，它是个 **ZIP 包**（46 个条目，全部 stored 不压缩），第一个条目是 `file_component.xml`：
+
+```xml
+<file_component checkvalue="1E6757E8..." signature="MGUCMG4ZKPK+...">
+  <filter ... version="25799" />
+  <file md5="b256f0a03bf1bc8613af8e860b62717c" length="237465648">runtime\flue.dll</file>
+  ...
+```
+
+划线开关那条 JS 就落在 `runtime/flue.dll` 这个条目里。改完之后有两层完整性信息会对不上：
+
+| 层 | 内容 | 能不能修 |
+|---|---|---|
+| ① ZIP 条目 CRC32 | 本地文件头 + 中央目录各记一份 | **能**，重算写回即可，不涉及任何密钥 |
+| ② 清单 md5 + ECDSA 签名 | `file_component.xml` 里 `flue.dll` 的 md5，整份清单有签名 | **不能**，私钥在腾讯手里 |
+
+工具会自动处理第 ① 层：打完补丁后重算 `runtime/flue.dll` 的 CRC32 并写回两处，让包至少是一个**结构合法的 ZIP**。还原时 CRC 会精确回到原值，因此可以无损回退（离线自检：`scripts/zip_crc_test.py`）。
+
+第 ② 层修不了。所以即便 CRC 已修正，仍有可能遇到微信提示「微信遇到问题，将影响网页正常浏览，可重启微信后恢复」——这是网页进程被回收后的恢复提示，选「暂不处理」后页面会显示 `STATUS_BREAKPOINT`。重启微信即可恢复，补丁仍然生效。
+
+要彻底避开这两层，只能不走改文件的路子，改成运行时注入（hook `wmpf_host_export_x64.dll` 或注入 `WeChatAppEx.exe`，在注入脚本执行前改掉那个标志）。目前未实现。
 
 ---
 
 ## 风险与回滚
 
-- 改动只涉及 `RadiumWMPF.bin` 的 8 个字节，不影响 `Weixin.exe` / `Weixin.dll`。
+- 改动只涉及 `RadiumWMPF.bin` 里 `runtime/flue.dll` 条目的 8 个字节 + 该条目的 CRC32 字段，不影响 `Weixin.exe` / `Weixin.dll`。
 - 若微信无法启动或内置浏览器异常，退出微信后点「还原」，或执行 `--cli revert`。
-- 还原会写回原始 8 字节并校验 SHA1 是否与改动前一致。
-- 微信升级前建议先还原，避免升级流程对文件做完整性校验时出现意外。
+- 还原会写回原始 8 字节、重算回原始 CRC32，并校验 SHA1 是否与改动前一致。
+- 微信升级前建议先还原，避免升级流程对文件做完整性校验时出现意外（见上一节）。
 
 ---
 
