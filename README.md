@@ -61,7 +61,7 @@ Windows 桌面端 `android` / `ios` / `harmony` 恒为 `false`，所以 `se` 和
 
 ## 使用方法
 
-> 从 [Releases](https://github.com/xxhhlk/wx-underline-switch/releases/latest) 下载 `WxUnderlineSwitch.exe`，或自行构建（见「自己构建」一节，`build.ps1` 一条命令，会同时生成中文名副本 `微信划线开关.exe`），也可以直接 `python src\wx_underline_switch.py` 运行（需 Python 3.8+ 带 tkinter）。
+> 从 [Releases](https://github.com/xxhhlk/wx-underline-switch/releases/latest) 下载 `WxUnderlineSwitch.exe`，或自行构建（见[构建](#构建)一节，`build.ps1` 一条命令，会同时生成中文名副本 `微信划线开关.exe`），也可以直接 `python src\wx_underline_switch.py` 运行（需 Python 3.8+ 带 tkinter）。
 
 1. **完全退出微信**（托盘图标右键退出，确认任务管理器里 `Weixin.exe` 和 `WeChatAppEx.exe` 都消失）
 2. 双击 `WxUnderlineSwitch.exe`
@@ -264,8 +264,8 @@ findstr /C:"4.1.15" "C:\Program Files\Tencent\Weixin\Weixin.exe"
 - 会周期性触发「微信遇到问题，将影响网页正常浏览」提示，原因是 `flue.dll` 的 Authenticode 签名被破坏。重启微信即恢复，补丁不丢。这一层改不掉。
 - 若微信无法启动或内置浏览器异常，退出微信后点「还原」，或执行 `--cli revert`。
 - 还原会写回原始 8 字节、重算回原始 CRC32，并校验 SHA1 是否与改动前一致。
-- **还原不会清理 `%APPDATA%\Tencent\xwechat\xplugin\...\extracted\runtime\flue.dll`**，那份解压副本可能仍是被改过的。彻底还原见上一节。
-- 微信升级前建议先还原，避免升级流程对文件做完整性校验时出现意外（见上一节）。
+- **还原不会清理 `%APPDATA%\Tencent\xwechat\xplugin\...\extracted\runtime\flue.dll`**，那份解压副本可能仍是被改过的。彻底还原见[还原后还要清理解压副本](#还原后还要清理解压副本)。
+- 微信升级前建议先还原，避免升级流程对文件做完整性校验时出现意外（见[组件完整性校验](#组件完整性校验)）。
 
 ---
 
