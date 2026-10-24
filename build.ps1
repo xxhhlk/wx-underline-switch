@@ -6,12 +6,16 @@
 # Requires: a Python 3 installation that includes tkinter.
 # Usage:    powershell -ExecutionPolicy Bypass -File build.ps1
 
+param([string]$PythonPath, [string]$BuildEnv)
+
 $ErrorActionPreference = "Stop"
 $root = Split-Path -Parent $MyInvocation.MyCommand.Path
 Set-Location $root
 
 # --- 1. locate a Python that has tkinter -------------------------------------
 $pyCandidates = @(
+    $PythonPath,
+    "$env:USERPROFILE\.workbuddy\binaries\python\versions\3.13.12\python.exe",
     "C:\Program Files\Python312\python.exe",
     "C:\Program Files\Python311\python.exe",
     "C:\Program Files\Python310\python.exe",
@@ -35,7 +39,15 @@ if (-not $python) {
 Write-Host ("Python: " + $python)
 
 # --- 2. venv -----------------------------------------------------------------
-$venv = Join-Path $root ".venv"
+$venv = $BuildEnv
+if (-not $venv) {
+    $venv = Join-Path $env:USERPROFILE ".workbuddy\binaries\python\envs\wx-release312"
+}
+$venvParent = Split-Path -Parent $venv
+if (-not (Test-Path $venvParent -PathType Container)) {
+    Write-Host "ERROR: BuildEnv parent directory must exist." -ForegroundColor Red
+    exit 1
+}
 if (-not (Test-Path $venv)) {
     Write-Host "Creating venv..."
     & $python -m venv $venv
@@ -49,8 +61,12 @@ if ($LASTEXITCODE -ne 0) { Write-Host "ERROR: pip install failed." -ForegroundCo
 
 # --- 3. pre-build checks -----------------------------------------------------
 Write-Host "Running pyflakes..."
-& $vpy -m pyflakes "src\wx_underline_switch.py"
+& $vpy -m pyflakes "src\wx_underline_switch.py" "src\offline_combo.py" "scripts\combo_test.py"
 if ($LASTEXITCODE -ne 0) { Write-Host "ERROR: pyflakes reported problems." -ForegroundColor Red; exit 1 }
+
+Write-Host "Running offline transaction tests..."
+& $vpy "scripts\combo_test.py"
+if ($LASTEXITCODE -ne 0) { Write-Host "ERROR: transaction tests failed." -ForegroundColor Red; exit 1 }
 
 Write-Host "Running GUI smoke test..."
 & $vpy "scripts\gui_smoketest.py"
@@ -60,8 +76,7 @@ if ($LASTEXITCODE -ne 0) { Write-Host "ERROR: GUI smoke test failed." -Foregroun
 & $vpy "scripts\make_icon.py" "assets\app.ico"
 if ($LASTEXITCODE -ne 0) { Write-Host "ERROR: icon generation failed." -ForegroundColor Red; exit 1 }
 
-# --specpath 会让 spec 里的相对路径以 spec 所在目录为基准，
-# 所以这里一律传绝对路径，否则 --icon 会被解析到 build\assets\app.ico
+# Use absolute paths because spec-relative paths resolve beneath build/.
 $iconPath = Join-Path $root "assets\app.ico"
 $entryPath = Join-Path $root "src\wx_underline_switch.py"
 

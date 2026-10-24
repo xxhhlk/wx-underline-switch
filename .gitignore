@@ -21,3 +21,11 @@ desktop.ini
 # 本地运行产物
 *.log
 config.json
+outputs/
+transactions/
+*.dll
+*.bin
+*.tar.gz
+*.dmp
+*.etl
+*.jsonl

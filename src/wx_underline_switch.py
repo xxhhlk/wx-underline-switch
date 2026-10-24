@@ -12,9 +12,10 @@
     把该字面量 true 改成同长度的 null（falsy），Windows 侧整条特性链即断开。
 
 实现要点：
-    不写死文件偏移。每次都在目标文件里按特征串
-    `support_mp_underline`（UTF-16LE / ASCII 双形态）重新定位，
-    再解析其后的布尔字面量，因此微信升级换版本后依然可用。
+    1.2.0 的写入使用 offline_combo 的严格文件摘要白名单，组合处理划线开关、
+    组件初始化和主程序定向摘要比较。未知版本拒绝写入，已有解压副本同步。
+    修改前完整备份，失败回滚；不使用常驻内存注入。
+    特征串扫描与 ZIP CRC 辅助函数仍供离线侦察脚本使用。
 
 用法：
     wx_underline_switch.py                 启动图形界面
@@ -26,6 +27,7 @@
 
 import argparse
 import ctypes
+import csv
 import glob
 import hashlib
 import json
@@ -39,6 +41,7 @@ import threading
 import zlib
 
 APP_NAME = "WxUnderlineSwitch"
+APP_VERSION = "1.2.0"
 BIN_NAME = "RadiumWMPF.bin"
 NEEDLE = "support_mp_underline"
 LITERAL_LEN = 4
@@ -228,12 +231,17 @@ def sha1_of_file(path, progress=None):
 def weixin_running():
     try:
         proc = subprocess.run(
-            ["tasklist", "/FI", "IMAGENAME eq Weixin.exe", "/NH"],
-            capture_output=True, timeout=20,
+            ["tasklist", "/FO", "CSV", "/NH"],
+            capture_output=True, timeout=20, check=True,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
             encoding="mbcs", errors="replace")
-    except (OSError, subprocess.SubprocessError):
+        rows = list(csv.reader(proc.stdout.splitlines(), strict=True))
+        if not rows or any(len(row) < 2 or not row[1].isdigit() for row in rows):
+            return None
+    except (OSError, subprocess.SubprocessError, csv.Error):
         return None
-    return "Weixin.exe" in (proc.stdout or "")
+    names = {"weixin.exe", "wechat.exe", "wechatappex.exe"}
+    return any(row and row[0].lower() in names for row in rows)
 
 
 # ---------------------------------------------------------------- ZIP 完整性
@@ -242,11 +250,11 @@ def weixin_running():
 # 第一个条目是 file_component.xml，带逐文件 md5 与 ECDSA 签名。
 # 划线开关那条 JS 落在 runtime/flue.dll 条目里，所以改写之后有三层对不上：
 #   ① 该条目的 CRC32 与本地文件头 / 中央目录里记的值对不上 —— 这一层可以重算修好；
-#   ② file_component.xml 里 flue.dll 的 md5 也变了，而清单有签名 —— 这一层修不了；
-#   ③ flue.dll 自身的 Authenticode 签名覆盖 .rdata，改一字节即失效 —— 这一层也修不了，
-#      而且它才是微信周期性弹「网页组件损坏」的真因（ComponentVerification.dll 调
-#      WinVerifyTrust 验的是 PE 签名，压根不看 ZIP 的 CRC）。
-# 这里只处理第 ① 层，让包至少是一个结构合法的 ZIP；②③ 无解，弹窗无法通过改文件消除。
+#   ② flue.dll 实际 md5 与签名清单记录不符；直接修改清单的实验未稳定运行；
+#   ③ flue.dll 的 Authenticode 签名摘要失配，不能在没有私钥时恢复官方签名。
+# 签名失配不等于已证明周期弹窗的唯一直接根因，导入 WinVerifyTrust 也不足以证明。
+# 下方 helpers 只处理第 ① 层。GUI/CLI 通过 offline_combo 组合修改两处校验行为，
+# 本机超过 9 小时验证无资源失效；版本白名单、签名状态与回退范围见 README。
 
 ZIP_EOCD = b"PK\x05\x06"
 ZIP_CD = b"PK\x01\x02"
@@ -324,109 +332,28 @@ def zip_refresh_crc(path, inner_offset, log=print):
 
 # ---------------------------------------------------------------- 动作
 
-def apply_patch(path, log=print, progress=None):
-    if not os.path.isfile(path):
-        return False, "目标文件不存在"
-    running = weixin_running()
-    if running is None:
-        return False, "无法确认微信是否在运行，已中止"
-    if running:
-        return False, "微信正在运行，请先完全退出微信（含托盘图标）"
-
-    sites = scan_sites(path, progress)
-    if not sites:
-        return False, "未在文件中找到划线开关特征串，可能是新版本改了写法"
-    todo = [s for s in sites if s[3] == "original"]
-    if not todo:
-        # 已经关闭，但 CRC 可能还是旧版本工具留下的失配值，补一遍
-        fixed = 0
-        for off, enc, width, state, literal in sites:
-            if state != "patched":
-                continue
-            info = zip_refresh_crc(path, off, log)
-            if info and info[3]:
-                log("ZIP 条目 %s CRC32: 0x%08X -> 0x%08X（已写回）" % (info[0], info[1], info[2]))
-                fixed += 1
-        if fixed:
-            return True, "已经是关闭状态，另修正了 %d 处 ZIP CRC" % fixed
-        return True, "已经是关闭状态，无需操作"
-
-    cfg = load_config()
-    backups = cfg.setdefault("backups", {})
-    entry = {
-        "size": os.path.getsize(path),
-        "sites": [],
-        "sha1_before": sha1_of_file(path, progress),
-    }
-    with open(path, "r+b") as fh:
-        for off, enc, width, state, literal in todo:
-            if len(literal) < LITERAL_LEN:
-                continue
-            fh.seek(off)
-            fh.write(PATCHED_LITERAL.encode(enc))
-            entry["sites"].append({"offset": off, "enc": enc,
-                                   "literal_before": literal})
-            log("已改写 0x%X (%s) %r -> %r" % (off, enc, literal, PATCHED_LITERAL))
-        fh.flush()
-        os.fsync(fh.fileno())
-
-    # 改写落在 ZIP 条目内部，条目 CRC32 已失配，重算写回（本地头 + 中央目录）
-    for site in entry["sites"]:
-        info = zip_refresh_crc(path, site["offset"], log)
-        if info:
-            name, old, new, changed = info
-            log("ZIP 条目 %s CRC32: 0x%08X -> 0x%08X%s"
-                % (name, old, new, "（已写回）" if changed else "（一致，无需改）"))
-
-    entry["sha1_after"] = sha1_of_file(path)
-    backups[path] = entry
-    cfg["target"] = path
-    save_config(cfg)
-    log("原始 SHA1: %s" % entry["sha1_before"])
-    log("改后 SHA1: %s" % entry["sha1_after"])
-    return True, "已关闭划线，共改写 %d 处" % len(entry["sites"])
+def apply_patch(path, log=print, progress=None, runtime=None):
+    from offline_combo import change_combo
+    if progress:
+        progress(0)
+    result = change_combo(path, runtime=runtime, log=log,
+                          backup_root=os.path.join(config_dir(), "transactions"),
+                          process_check=weixin_running)
+    if progress:
+        progress(100)
+    return result
 
 
-def revert_patch(path, log=print, progress=None):
-    if not os.path.isfile(path):
-        return False, "目标文件不存在"
-    running = weixin_running()
-    if running is None:
-        return False, "无法确认微信是否在运行，已中止"
-    if running:
-        return False, "微信正在运行，请先完全退出微信（含托盘图标）"
-
-    sites = scan_sites(path, progress)
-    if not sites:
-        return False, "未在文件中找到划线开关特征串"
-    todo = [s for s in sites if s[3] == "patched" and len(s[4]) >= LITERAL_LEN]
-    if not todo:
-        return True, "当前已是原始状态，无需还原"
-
-    with open(path, "r+b") as fh:
-        for off, enc, width, state, literal in todo:
-            fh.seek(off)
-            fh.write(ORIGINAL_LITERAL.encode(enc))
-            log("已还原 0x%X (%s) %r -> %r" % (off, enc, literal, ORIGINAL_LITERAL))
-        fh.flush()
-        os.fsync(fh.fileno())
-
-    # 还原后数据回到原始状态，CRC32 重算应当正好回到原值
-    for off, enc, width, state, literal in todo:
-        info = zip_refresh_crc(path, off, log)
-        if info:
-            name, old, new, changed = info
-            log("ZIP 条目 %s CRC32: 0x%08X -> 0x%08X%s"
-                % (name, old, new, "（已写回）" if changed else "（一致，无需改）"))
-
-    cfg = load_config()
-    entry = cfg.get("backups", {}).get(path)
-    after = sha1_of_file(path)
-    if entry and entry.get("sha1_before"):
-        log("还原后 SHA1: %s" % after)
-        log("原始 SHA1  : %s" % entry["sha1_before"])
-        log("一致性      : %s" % ("一致" if after == entry["sha1_before"] else "不一致"))
-    return True, "已还原，共恢复 %d 处" % len(todo)
+def revert_patch(path, log=print, progress=None, runtime=None):
+    from offline_combo import change_combo
+    if progress:
+        progress(0)
+    result = change_combo(path, restore=True, runtime=runtime, log=log,
+                          backup_root=os.path.join(config_dir(), "transactions"),
+                          process_check=weixin_running)
+    if progress:
+        progress(100)
+    return result
 
 
 # ---------------------------------------------------------------- 高 DPI
@@ -487,7 +414,7 @@ def run_gui():
         """把 96 DPI 下的设计像素换算成当前 DPI 的实际像素。"""
         return int(round(value * scale))
 
-    root.title("微信划线开关")
+    root.title("微信划线开关 v%s" % APP_VERSION)
     # 窗口按 DPI 放大，但不超过屏幕九成，避免高缩放下超出可视区
     win_w = min(px(760), int(root.winfo_screenwidth() * 0.92))
     win_h = min(px(520), int(root.winfo_screenheight() * 0.88))
@@ -523,8 +450,8 @@ def run_gui():
             path_var.set(chosen)
             refresh()
 
-    ttk.Button(path_row, text="浏览", width=8,
-               command=browse).pack(side="left", padx=(px(6), 0))
+    btn_browse = ttk.Button(path_row, text="浏览", width=8, command=browse)
+    btn_browse.pack(side="left", padx=(px(6), 0))
 
     info = ttk.LabelFrame(outer, text=" 状态 ", padding=px(10))
     info.pack(fill="x", pady=px(10))
@@ -595,7 +522,7 @@ def run_gui():
 
     def set_busy(flag, hint=""):
         state["busy"] = flag
-        for b in (btn_apply, btn_revert, btn_refresh):
+        for b in (btn_apply, btn_revert, btn_refresh, btn_browse, entry):
             b.configure(state="disabled" if flag else "normal")
         if hint:
             status_var.set(hint)
@@ -607,7 +534,8 @@ def run_gui():
         bar.configure(value=0)
 
     def refresh():
-        path = state["path"]
+        path = path_var.get().strip()
+        state["path"] = path
         if not path or not os.path.isfile(path):
             status_var.set("未找到 RadiumWMPF.bin")
             detail_var.set("请用「浏览」手动指定微信安装目录下的该文件")
@@ -617,13 +545,12 @@ def run_gui():
 
         def work():
             try:
-                sites = scan_sites(path, ui_progress)
-                summary = summarize(sites)
-                size_mb = os.path.getsize(path) / 1048576.0
-                detail = "%s ｜ %.1f MB ｜ 命中 %d 处" % (
-                    os.path.basename(os.path.dirname(path)), size_mb, len(sites))
-                for off, enc, width, st, lit in sites:
-                    log("  0x%X  %-10s  %-8s  %r" % (off, enc, st, lit))
+                from offline_combo import inspect_combo
+                report = inspect_combo(path)
+                summary = report["summary"]
+                detail = "组件包：%s ｜ 主程序：%s ｜ 缓存：%s" % (
+                    report["package_state"], report["dll_state"], report["runtime_state"])
+                log(json.dumps(report, ensure_ascii=False, indent=2))
                 post(lambda: finish(summary, detail))
             except Exception as exc:                      # noqa: BLE001
                 post(lambda e=exc: (status_var.set("扫描失败"),
@@ -639,18 +566,25 @@ def run_gui():
         threading.Thread(target=work, daemon=True).start()
 
     def do_apply():
-        path = state["path"]
+        path = path_var.get().strip()
+        state["path"] = path
         if not path:
             messagebox.showwarning("未选择文件", "请先指定 RadiumWMPF.bin")
             return
         if not messagebox.askyesno(
-                "确认", "将修改微信内置浏览器运行时，关闭公众号文章里的划线显示。\n\n"
-                        "要求：微信已完全退出。\n修改前会自动记录原始校验值，可随时还原。\n\n继续吗？"):
+                "确认", "将关闭划线并应用本机验证过的离线组合。\n\n"
+                        "仅支持已识别的 4.1.15.56 / RadiumWMPF 25799 文件基线。\n"
+                        "微信及内置浏览器必须完全退出。修改前完整备份，失败自动回滚。\n"
+                        "已有解压副本会同步；不运行常驻注入。\n\n"
+                        "组件包：%s\n同目录 Weixin.dll 将一并处理。\n\n继续吗？" % os.path.abspath(path)):
             return
         set_busy(True, "写入中…")
 
         def work():
-            ok, msg = apply_patch(path, log, ui_progress)
+            try:
+                ok, msg = apply_patch(path, log, ui_progress)
+            except Exception as exc:                      # noqa: BLE001
+                ok, msg = False, "操作异常：%s" % exc
 
             def done():
                 set_busy(False)
@@ -664,16 +598,20 @@ def run_gui():
         threading.Thread(target=work, daemon=True).start()
 
     def do_revert():
-        path = state["path"]
+        path = path_var.get().strip()
+        state["path"] = path
         if not path:
             messagebox.showwarning("未选择文件", "请先指定 RadiumWMPF.bin")
             return
-        if not messagebox.askyesno("确认", "将把划线开关恢复为原始状态。\n\n要求：微信已完全退出。\n\n继续吗？"):
+        if not messagebox.askyesno("确认", "将还原划线开关、组件初始化及主程序定向比较补丁，\n并同步已识别的解压副本。保留主程序基线原有的其他修改。\n\n要求：微信及内置浏览器完全退出。修改前完整备份。\n\n组件包：%s\n同目录 Weixin.dll 将一并处理。\n\n继续吗？" % os.path.abspath(path)):
             return
         set_busy(True, "还原中…")
 
         def work():
-            ok, msg = revert_patch(path, log, ui_progress)
+            try:
+                ok, msg = revert_patch(path, log, ui_progress)
+            except Exception as exc:                      # noqa: BLE001
+                ok, msg = False, "操作异常：%s" % exc
 
             def done():
                 set_busy(False)
@@ -690,6 +628,13 @@ def run_gui():
     btn_revert.configure(command=do_revert)
     btn_refresh.configure(command=refresh)
 
+    def on_close():
+        if state["busy"]:
+            messagebox.showwarning("操作进行中", "请等待当前检测、写入或还原完成后再关闭工具。")
+            return
+        root.destroy()
+
+    root.protocol("WM_DELETE_WINDOW", on_close)
     log("提示：修改前请完全退出微信，修改后重新启动微信生效。")
     drain()
     refresh()
@@ -713,7 +658,7 @@ def _ensure_console():
         pass
 
 
-def run_cli(action, target):
+def run_cli(action, target, runtime=None):
     _ensure_console()
     if sys.stdout is None:
         return 2
@@ -722,32 +667,38 @@ def run_cli(action, target):
         print("未找到 RadiumWMPF.bin，请用 --target 指定")
         return 2
     print("目标: %s" % path)
-    if action == "status":
-        sites = scan_sites(path)
-        print("状态: %s" % summarize(sites))
-        for off, enc, width, st, lit in sites:
-            print("  0x%X  %-10s  %-8s  %r" % (off, enc, st, lit))
-        return 0
-    if action == "apply":
-        ok, msg = apply_patch(path)
-        print(msg)
-        return 0 if ok else 1
-    if action == "revert":
-        ok, msg = revert_patch(path)
-        print(msg)
-        return 0 if ok else 1
+    try:
+        if action == "status":
+            from offline_combo import inspect_combo
+            report = inspect_combo(path, runtime=runtime)
+            print(json.dumps(report, ensure_ascii=False, indent=2))
+            return 0 if report["supported"] else 1
+        if action in ("apply", "revert"):
+            operation = apply_patch if action == "apply" else revert_patch
+            ok, msg = operation(path, runtime=runtime)
+            print(msg)
+            return 0 if ok else 1
+    except (OSError, ValueError, RuntimeError) as exc:
+        print("操作失败：%s" % exc)
+        return 1
     print("未知动作: %s" % action)
     return 2
 
 
 def main():
-    parser = argparse.ArgumentParser(description="微信划线开关")
+    parser = argparse.ArgumentParser(description="微信划线开关：版本锁定离线组合")
+    parser.add_argument("--version", action="version", version=APP_VERSION)
     parser.add_argument("--cli", choices=["status", "apply", "revert"],
-                        help="命令行模式")
+                        help="命令行模式；apply/revert处理完整组合")
     parser.add_argument("--target", help="RadiumWMPF.bin 路径")
+    parser.add_argument("--runtime", help="手动指定对应 extracted/runtime 目录，仅用于CLI")
+    if sys.argv[1:]:
+        _ensure_console()
     args = parser.parse_args()
+    if args.runtime and not args.cli:
+        parser.error("--runtime 必须与 --cli 一起使用")
     if args.cli:
-        return run_cli(args.cli, args.target)
+        return run_cli(args.cli, args.target, args.runtime)
     run_gui()
     return 0
 
